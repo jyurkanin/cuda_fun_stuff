@@ -1,0 +1,6 @@
+Able to generate Kernels in matlab that result in Hurwitz system dynamics
+
+One property I've noticed is that for grid size n, if the system dynamics is hurwitz for some n,
+then it is Hurwitz for all n. Cant prove this, this is empirical.
+
+
