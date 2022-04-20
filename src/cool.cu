@@ -1,12 +1,14 @@
 #include <SDL2/SDL.h>
 #include <stdio.h>
-//#include <math.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 //#include "cool.h"
 
+#define GS (0x100)
+#define KR (1)
+#define KS (1 + (2*KR))
 
-const int SCREEN_WIDTH = 640;
-const int SCREEN_HEIGHT = 640;
 
 __device__
 void HSVtoRGB(float& fR, float& fG, float& fB, float& fH, float& fS, float& fV) {
@@ -51,42 +53,56 @@ void HSVtoRGB(float& fR, float& fG, float& fB, float& fH, float& fS, float& fV) 
 }
 
 __global__
-void compute_pixel(int n, float param, float *x, float *y, unsigned int *pixel, unsigned int *prev_pixel){
+void computeODE(int n, float *X, float *Xd, float *K){
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
     
-    float red;
-    float green;
-    float blue;
-    
-    unsigned red_u;
-    unsigned green_u;
-    unsigned blue_u;
-    
-    float hue;
-    float sat = 1;
-    float val = 1;
-    
     for(int i = idx; i < n; i += stride){
-        float r1 = x[i];
-        float r2 = y[i];
-        float nr1;
-        int j;
-        for(j = 0; j < 1000 && ((r1*r1)+(r2*r2)) < 36; j++){
-            r1 =  r1 + param/r2; //looks like a sunset around param <= -7
-            r2 = -r2 + 1/r1 + 1/r2;
-            r1 = nr1;
-        }
+      int x = i & 0xFF;
+      int y = (i & 0xFF00) >> 8;
+      
+      Xd[i] = 0;
 
-        //hue = 350.0f*j/1000;
-        red_u = (unsigned) 85*log10f(1 + (float)j);
-        green_u = 0;
-        blue_u = 0;
-        pixel[i] = (red_u << 16) + (green_u << 8) + blue_u;
-        
-        
+      //x + kx - KR
+      int off_x = x - KR;
+      int off_y = y - KR;
+
+      for(int ky = 0; ky < KS; ky++){
+        for(int kx = 0; kx < KS; kx++){
+          int tempx = (GS + (kx + off_x)) & 0xFF; //This is equivalent to a modulus.
+          int tempy = (GS + (ky + off_y)) & 0xFF;
+          
+          int k_idx = (ky*KS) + kx;
+          int x_idx = (tempy*GS) + tempx;
+          Xd[i] += K[k_idx]*X[x_idx];
+        }
+      }
     }
 }
+
+__global__
+void get_pixels(int n, float *X, unsigned *pixels){
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+  
+  for(int i = idx; i < n; i += stride){
+    //pixels[i] = (unsigned) (0x800000 + (0x100*X[i]));
+    pixels[i] = 0x10000*X[i] + 0xFF0000;
+  }
+}
+
+
+__global__
+void updateState(int n, float *X, float *Xd){
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+
+  float ts = .01;
+  for(int i = idx; i < n; i += stride){
+    X[i] += ts*Xd[i];
+  }
+}
+
 
 
 
@@ -108,8 +124,8 @@ int main( int argc, char* args[]){
         return 1;
     }
     
-    int width = dm.w;
-    int height = dm.h;
+    int width = GS; //dm.w;
+    int height = GS; //dm.h;
     
     window = SDL_CreateWindow( "Shit Poop", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, width, height, SDL_WINDOW_SHOWN );
     if(window == NULL) {
@@ -119,7 +135,7 @@ int main( int argc, char* args[]){
         return 0;
     }
   
-    SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN);
+    //SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN);
     
     
     SDL_Surface *window_surface = SDL_GetWindowSurface(window);
@@ -138,71 +154,124 @@ int main( int argc, char* args[]){
     printf("My device is #%d\n", device);
     
     unsigned int *cuda_pixel_buf = 0; //stores result.
-    unsigned int *cuda_pixel_buf_prev = 0;
-    float *cuda_x_buf;
-    float *cuda_y_buf;
+    float *cuda_X;
+    float *cuda_Xd;
+    float *cuda_K;
     
     cudaMallocManaged(&cuda_pixel_buf, num_pixels*sizeof(unsigned int));
-    cudaMallocManaged(&cuda_pixel_buf_prev, num_pixels*sizeof(unsigned int));
-    cudaMallocManaged(&cuda_x_buf, num_pixels*sizeof(float));
-    cudaMallocManaged(&cuda_y_buf, num_pixels*sizeof(float));
+    cudaMallocManaged(&cuda_X, num_pixels*sizeof(float));
+    cudaMallocManaged(&cuda_Xd, num_pixels*sizeof(float));
+    cudaMallocManaged(&cuda_K, KS*KS*sizeof(float));
+
+    float k1 = 1;
+    float k2 = .5;
+    float temp_value[KS*KS] = {
+                               0, k1, k2,
+                               -k1, 0, k1,
+                               -k2, -k1, 0
+    };
+    for(int i = 0; i < KS*KS; i++){
+      cuda_K[i] = temp_value[i];
+    }
     
-    //printf("cuda error %d\n", error);
     
     unsigned int cnt = 0;
     for(int y = 0; y < height; y++){
         for(int x = 0; x < width; x++){
-            cuda_x_buf[cnt] = (10*x/(float)width) - 5.0f;
-            cuda_y_buf[cnt] = (10*y/(float)height) - 5.0f;
-            cuda_pixel_buf_prev[cnt] = 0;
-            cnt++;
+          cuda_X[cnt] = 0; //(rand() / (float)RAND_MAX);
+          cnt++;
         }
     }
+
+    int rradius = 8;
+    for(int i = -rradius; i <= rradius; i++){
+      for(int j = -rradius; j <= rradius; j++){
+        cuda_X[((127+i)*GS) + 127+j] = 1;
+        //cuda_X[((127+i)*GS) + 127+j] += (param*rand() / (float)RAND_MAX);
+      }
+    }
     
-    float param = 1;
+    //cuda_X[(GS*GS/2) + (GS/2)] = 1;
+    
+    float param = 4;
+    int paused = 1;
     while(1){
         SDL_Event event;
         while(SDL_PollEvent(&event)) {
-            if(event.type == SDL_QUIT || (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)){
-                SDL_DestroyWindow( window );
-                SDL_Quit();
-                cudaFree(cuda_pixel_buf);
-                cudaFree(cuda_x_buf);
-                cudaFree(cuda_y_buf);
-                return 0;
+          if(event.type == SDL_KEYDOWN ){
+            if(event.key.keysym.sym == SDLK_ESCAPE){
+              SDL_DestroyWindow( window );
+              SDL_Quit();
+              
+              cudaFree(cuda_pixel_buf);
+              cudaFree(cuda_X);
+              cudaFree(cuda_Xd);
+              cudaFree(cuda_K);
+              return 0;
             }
-            if(event.type == SDL_WINDOWEVENT) {
-                if(event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                    window_surface = SDL_GetWindowSurface(window);
-                    pixels = (unsigned int *) window_surface->pixels;
-                    width = window_surface->w;
-                    height = window_surface->h;
-                    printf("Size changed: %d, %d\n", width, height);
-                }
+            else if(event.key.keysym.sym == SDLK_RETURN){
+              paused = !paused;
             }
+          }
+          if(event.type == SDL_QUIT){
+            SDL_DestroyWindow( window );
+            SDL_Quit();
+            
+            cudaFree(cuda_pixel_buf);
+            cudaFree(cuda_X);
+            cudaFree(cuda_Xd);
+            cudaFree(cuda_K);
+            return 0;
+          }
+          if(event.type == SDL_WINDOWEVENT) {
+            if(event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+              window_surface = SDL_GetWindowSurface(window);
+              pixels = (unsigned int *) window_surface->pixels;
+              width = window_surface->w;
+              height = window_surface->h;
+              printf("Size changed: %d, %d\n", width, height);
+            }
+          }
+        }
+        
+        if(paused){
+          usleep(10000);
+          continue;
         }
         
         int blockSize = 256;
         int numBlocks = (int) ceilf(num_pixels / blockSize);
-        printf("param %f\n", param);
-        compute_pixel<<<numBlocks, blockSize>>>(num_pixels, param, cuda_x_buf, cuda_y_buf, cuda_pixel_buf, cuda_pixel_buf_prev);
+        //printf("param %f\n", param);
+        computeODE<<<numBlocks, blockSize>>>(num_pixels, cuda_X, cuda_Xd, cuda_K);
+        updateState<<<numBlocks, blockSize>>>(num_pixels, cuda_X, cuda_Xd);
+        get_pixels<<<numBlocks, blockSize>>>(num_pixels, cuda_X, cuda_pixel_buf);
         cudaDeviceSynchronize();
-
-        pixels[0] = cuda_pixel_buf[0];
-        cuda_pixel_buf_prev[0] = cuda_pixel_buf[num_pixels-1];
-        for(int ii = 1; ii < num_pixels; ii++){
-            pixels[ii] = cuda_pixel_buf[ii];
-            cuda_pixel_buf_prev[ii] = cuda_pixel_buf[ii-1];
-            
+        
+        printf("0,0: %f\n", cuda_X[0]);
+        
+        //int rradius = 8;
+        for(int i = -rradius; i <= rradius; i++){
+          for(int j = -rradius; j <= rradius; j++){ 
+            //cuda_X[((127+i)*GS) + 127+j] += (param*rand() / (float)RAND_MAX);
+          }
         }
-        param -= .01f;
+
+        
+        for(int ii = 0; ii < num_pixels; ii++){
+          pixels[ii] = cuda_pixel_buf[ii];
+        }
+        
+        //param = .01f;
+        //
         SDL_UpdateWindowSurface(window);
     }
     
     SDL_DestroyWindow(window);
     SDL_Quit();
+    
     cudaFree(cuda_pixel_buf);
-    cudaFree(cuda_x_buf);
-    cudaFree(cuda_y_buf);
+    cudaFree(cuda_X);
+    cudaFree(cuda_Xd);
+    cudaFree(cuda_K);
     return 0;
 }
